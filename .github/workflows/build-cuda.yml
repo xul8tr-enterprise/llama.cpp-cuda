@@ -132,11 +132,13 @@ jobs:
               apt-get update -qq
               ARCH=\$(uname -m)
               if [ "\$ARCH" = "aarch64" ]; then
+                # GCC 13 (Ubuntu 24.04 default) does not support the +sme feature modifier
+                # required by GGML_CPU_ALL_VARIANTS armv9.2 variant. GCC 14 adds SME support.
                 apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates gcc-14 g++-14
-                export CC=gcc-14
-                export CXX=g++-14
+                CMAKE_COMPILER_FLAGS="-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14"
               else
                 apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+                CMAKE_COMPILER_FLAGS=""
               fi
               apt-get clean
               rm -rf /var/lib/apt/lists/*
@@ -153,6 +155,7 @@ jobs:
 
               cmake -B build -S . \
                 -G Ninja \
+                \$CMAKE_COMPILER_FLAGS \
                 -DGGML_CUDA=ON \
                 -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
                 -DCMAKE_BUILD_TYPE=Release \
