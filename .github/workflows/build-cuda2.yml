@@ -1,0 +1,270 @@
+name: Build llama.cpp with CUDA 2
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_hash: ${{ steps.check.outputs.release_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new llama.cpp release
+        id: check
+        run: |
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
+          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
+
+          echo "Latest llama.cpp release: $LATEST_RELEASE"
+          echo "Release hash: $RELEASE_HASH"
+
+          if git tag | grep -q "^${LATEST_RELEASE}$"; then
+            echo "Release $LATEST_RELEASE already built"
+            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+              echo "Force build enabled, building anyway"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "New release detected: $LATEST_RELEASE"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_version: "12.9.2"
+            cuda_short: "12.9"
+            architectures: "60;61;62;70;72"
+            cuda_tag: "12.9.2-cudnn-devel-ubuntu24.04"
+            arch: "amd64"
+            runner: "ubuntu-latest"
+          - cuda_version: "13.3.0"
+            cuda_short: "13.3"
+            architectures: "75;80;86;89;90;100;103;110;120;121"
+            cuda_tag: "13.3.0-cudnn-devel-ubuntu24.04"
+            arch: "amd64"
+            runner: "ubuntu-latest"
+            
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build llama.cpp with CUDA
+        run: |
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+
+          docker run --rm \
+            -v $PWD:/workspace \
+            nvidia/cuda:${{ matrix.cuda_tag }} \
+            bash -c "
+              set -e
+
+              echo '=== Installing minimal dependencies ==='
+              apt-get update -qq
+              ARCH=\$(uname -m)
+              if [ \"\$ARCH\" = \"aarch64\" ]; then
+                # GCC 13 (Ubuntu 24.04 default) does not support the +sme feature modifier
+                # required by GGML_CPU_ALL_VARIANTS armv9.2 variant. GCC 14 adds SME support.
+                apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates gcc-14 g++-14
+                CMAKE_COMPILER_FLAGS=\"-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14\"
+              else
+                apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+                CMAKE_COMPILER_FLAGS=\"\"
+              fi
+              apt-get clean
+              rm -rf /var/lib/apt/lists/*
+
+              echo '=== Cloning llama.cpp ==='
+              cd /workspace
+              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
+                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
+              cd llama.cpp
+
+              echo '=== Configuring build with Ninja ==='
+              export LIBRARY_PATH=\\\"/usr/local/cuda/lib64/stubs\\\$\{LIBRARY_PATH:+:\\\$LIBRARY_PATH\}\\\"
+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+              cmake -B build -S . \
+                -G Ninja \
+                \$CMAKE_COMPILER_FLAGS \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DGGML_NATIVE=OFF \
+                -DGGML_BACKEND_DL=ON \
+                -DGGML_CPU_ALL_VARIANTS=ON \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+
+              echo '=== Building with Ninja (parallel: all cores) ==='
+              cmake --build build --config Release -j\$(nproc)
+
+              echo '=== Copying binaries ==='
+              cd /workspace
+              mkdir -p binaries/cuda-${{ matrix.cuda_short }}
+
+              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_short }}/
+
+              if [ -d llama.cpp/build/lib ]; then
+                find llama.cpp/build/lib -name '*.so*' -exec cp {} binaries/cuda-${{ matrix.cuda_short }}/ \; 2>/dev/null || true
+              fi
+
+              find binaries/cuda-${{ matrix.cuda_short }}/ -type f -executable ! -name '*.so*' -exec strip {} \; 2>/dev/null || true
+
+              echo '=== Bundling CUDA runtime libraries ==='
+              cd /workspace/llama.cpp/build/bin
+              for f in *; do
+                if [ -f \"\$f\" ]; then
+                  ldd \"\$f\" 2>/dev/null | grep /usr/local/cuda | awk '{print \$3}' >> /tmp/cuda_libs.txt
+                fi
+              done
+              sort -u /tmp/cuda_libs.txt | while read lib; do
+                if [ -n \"\$lib\" ] && [ -f \"\$lib\" ]; then
+                  cp -v \"\$lib\" /workspace/binaries/cuda-${{ matrix.cuda_short }}/
+                fi
+              done
+
+              echo '=== Creating version info ==='
+              echo \"llama.cpp version: ${{ needs.check-release.outputs.release_tag }}\" > binaries/cuda-${{ matrix.cuda_short }}/VERSION.txt
+              echo \"CUDA version: ${{ matrix.cuda_version }}\" >> binaries/cuda-${{ matrix.cuda_short }}/VERSION.txt
+              echo \"Architectures: ${{ matrix.architectures }}\" >> binaries/cuda-${{ matrix.cuda_short }}/VERSION.txt
+              echo \"Build date: \$(date -u +%Y-%m-%d)\" >> binaries/cuda-${{ matrix.cuda_short }}/VERSION.txt
+              echo \"Build hash: ${{ needs.check-release.outputs.release_hash }}\" >> binaries/cuda-${{ matrix.cuda_short }}/VERSION.txt
+
+              echo '=== Build complete ==='
+              ls -lh binaries/cuda-${{ matrix.cuda_short }}/
+
+              echo '=== Cleaning up build directory ==='
+              rm -rf llama.cpp
+            "
+
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+
+          sudo chown -R $(id -u):$(id -g) $PWD
+
+          echo "=== Final disk usage ==="
+          df -h
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_short }}-${{ matrix.arch }}.tar.gz cuda-${{ matrix.cuda_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-cuda-${{ matrix.cuda_short }}-${{ matrix.arch }}
+          path: binaries/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
+          body: |
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+
+            Pre-built binaries of llama.cpp with CUDA support for multiple CUDA versions.
+
+            **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            **Commit:** ${{ needs.check-release.outputs.release_hash }}
+
+            ## CUDA Versions
+
+            | CUDA | GPU Architectures | Min. Driver |
+            |------|------------------|-------------|
+            | 12.9 | sm_60, sm_61, sm_62, sm_70, sm_72 | >= 575.51.03 |
+            | 13.3 | sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_103, sm_110, sm_120, sm_121 | >= 610.43.02 |
+
+            ## Host architectures
+
+            Tarballs are published per host CPU architecture (Linux):
+            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
+
+            ## GPU compute capability reference
+
+            ### CUDA 12.9 (legacy GPUs)
+            - 6.0: Pascal GP100 (Tesla P100)
+            - 6.1: Titan XP, Tesla P40, GTX 10xx
+            - 6.2: Tesla P40, GTX 10xx
+            - 7.0: Tesla V100
+            - 7.2: Tegra Xavier
+
+            ### CUDA 13.3 (modern GPUs)
+            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
+            - 8.0: A100
+            - 8.6: RTX 3000 series
+            - 8.9: RTX 4000 series, L4, L40
+            - 9.0: H100, H200, GH200
+            - 10.0: B200, GB200
+            - 10.3: GB300
+            - 11.0: DGX Spark (Grace Blackwell)
+            - 12.0: RTX Pro 6000, RTX 50xx series
+            - 12.1: RTX 50xx series
+
+            ## Choosing a CUDA version
+
+            - Use **CUDA 12.9** if you have a GPU with compute capability 6.1, 6.2, 7.0, or 7.2 (GTX 10xx, Tesla V100, etc.).
+            - Use **CUDA 13.3** if you have a GPU with compute capability 7.5+ (most modern GPUs).
+
+            ## Usage
+
+            Download the tarball matching your host CPU arch and CUDA version, then extract:
+            ```bash
+            # amd64 host, CUDA 13.3
+            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-13.3-amd64.tar.gz
+            cd cuda-13.3
+            ./llama-cli --help
+            ```
+          files: release-assets/*
+          draft: false
+          prerelease: false
