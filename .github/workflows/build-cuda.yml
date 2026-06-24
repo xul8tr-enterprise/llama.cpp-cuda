@@ -62,13 +62,13 @@ jobs:
             architectures: "60;61;62;70;72"
             cuda_tag: "12.9.2-cudnn-devel-ubuntu24.04"
             arch: "amd64"
-            runner: "ubuntu-slim"
+            runner: "ubuntu-latest"
           - cuda_version: "13.3.0"
             cuda_short: "13.3"
             architectures: "75;80;86;89;90;100;103;110;120;121"
             cuda_tag: "13.3.0-cudnn-devel-ubuntu24.04"
             arch: "amd64"
-            runner: "ubuntu-slim"
+            runner: "ubuntu-latest"
           - cuda_version: "12.9.2"
             cuda_short: "12.9"
             architectures: "60;61;62;70;72"
@@ -130,7 +130,16 @@ jobs:
 
               echo '=== Installing minimal dependencies ==='
               apt-get update -qq
-              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+              ARCH=\$(uname -m)
+              if [ "\$ARCH" = "aarch64" ]; then
+                # GCC 13 (Ubuntu 24.04 default) does not support the +sme feature modifier
+                # required by GGML_CPU_ALL_VARIANTS armv9.2 variant. GCC 14 adds SME support.
+                apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates gcc-14 g++-14
+                CMAKE_COMPILER_FLAGS="-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14"
+              else
+                apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+                CMAKE_COMPILER_FLAGS=""
+              fi
               apt-get clean
               rm -rf /var/lib/apt/lists/*
 
@@ -146,6 +155,7 @@ jobs:
 
               cmake -B build -S . \
                 -G Ninja \
+                \$CMAKE_COMPILER_FLAGS \
                 -DGGML_CUDA=ON \
                 -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
                 -DCMAKE_BUILD_TYPE=Release \
